@@ -5,14 +5,15 @@ on:
     - cron: "0 0 * * 1,4"
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   TARGET_OWNER: navaranjithsai
   TARGET_REPO: MailVoyage
   GIST_FILENAME: clone.json
   GIST_DESCRIPTION: MailVoyage clone statistics
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -22,6 +23,41 @@ jobs:
       - name: Checkout xyz repo
         uses: actions/checkout@v4
 
+      - name: Validate PAT and repo access
+        id: auth
+        env:
+          GH_PAT: ${{ secrets.ABC_PAT }}
+        run: |
+          set -euo pipefail
+
+          USER_CODE=$(curl -sS -o user.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${GH_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/user)
+
+          if [ "$USER_CODE" != "200" ]; then
+            echo "PAT validation failed. HTTP $USER_CODE"
+            cat user.json
+            exit 1
+          fi
+
+          LOGIN=$(jq -r '.login' user.json)
+          echo "PAT owner: $LOGIN"
+          echo "login=$LOGIN" >> "$GITHUB_OUTPUT"
+
+          REPO_CODE=$(curl -sS -o repo.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${GH_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${TARGET_OWNER}/${TARGET_REPO}")
+
+          if [ "$REPO_CODE" != "200" ]; then
+            echo "Cannot access ${TARGET_OWNER}/${TARGET_REPO}. HTTP $REPO_CODE"
+            cat repo.json
+            exit 1
+          fi
+
       - name: Fetch latest clone traffic from target repo
         env:
           GH_PAT: ${{ secrets.ABC_PAT }}
@@ -30,9 +66,7 @@ jobs:
 
           API_URL="https://api.github.com/repos/${TARGET_OWNER}/${TARGET_REPO}/traffic/clones"
 
-          HTTP_CODE=$(curl -sS -L \
-            -o clone.json \
-            -w "%{http_code}" \
+          HTTP_CODE=$(curl -sS -o clone.json -w "%{http_code}" \
             -H "Authorization: Bearer ${GH_PAT}" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
@@ -44,26 +78,26 @@ jobs:
             exit 1
           fi
 
-          echo "Latest traffic data:"
+          echo "Current clone traffic:"
           jq . clone.json
 
-      - name: Find existing gist or create a new gist under navaranjithsai
+      - name: Find or create gist under navaranjithsai
         id: gist
         env:
           GH_PAT: ${{ secrets.ABC_PAT }}
         run: |
           set -euo pipefail
 
-          HTTP_CODE=$(curl -sS -L \
-            -o gists.json \
-            -w "%{http_code}" \
+          LOGIN="${{ steps.auth.outputs.login }}"
+
+          LIST_CODE=$(curl -sS -o gists.json -w "%{http_code}" \
             -H "Authorization: Bearer ${GH_PAT}" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/gists?per_page=100")
 
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "Failed to list gists. HTTP $HTTP_CODE"
+          if [ "$LIST_CODE" != "200" ]; then
+            echo "Failed to list gists. HTTP $LIST_CODE"
             cat gists.json
             exit 1
           fi
@@ -75,7 +109,7 @@ jobs:
             gists.json)
 
           if [ -z "$GIST_ID" ]; then
-            echo "No existing gist found. Creating a new one..."
+            echo "No existing gist found. Creating one..."
 
             jq -n \
               --arg desc "$GIST_DESCRIPTION" \
@@ -91,9 +125,7 @@ jobs:
                 }
               }' > create_gist.json
 
-            HTTP_CODE=$(curl -sS -L \
-              -o gist_response.json \
-              -w "%{http_code}" \
+            CREATE_CODE=$(curl -sS -o gist_response.json -w "%{http_code}" \
               -X POST \
               -H "Authorization: Bearer ${GH_PAT}" \
               -H "Accept: application/vnd.github+json" \
@@ -102,55 +134,44 @@ jobs:
               -d @create_gist.json \
               "https://api.github.com/gists")
 
-            if [ "$HTTP_CODE" != "201" ]; then
-              echo "Failed to create gist. HTTP $HTTP_CODE"
+            if [ "$CREATE_CODE" != "201" ]; then
+              echo "Failed to create gist. HTTP $CREATE_CODE"
               cat gist_response.json
               exit 1
             fi
 
             GIST_ID=$(jq -r '.id' gist_response.json)
-            GIST_OWNER=$(jq -r '.owner.login' gist_response.json)
-
             cp clone.json clone_before.json
           else
-            echo "Existing gist found: $GIST_ID"
+            echo "Found existing gist: $GIST_ID"
 
-            GIST_OWNER=$(jq -r \
-              --arg id "$GIST_ID" \
-              '.[] | select(.id == $id) | .owner.login // empty' \
-              gists.json)
+            RAW_URL="https://gist.githubusercontent.com/${LOGIN}/${GIST_ID}/raw/${GIST_FILENAME}"
 
-            if [ -z "$GIST_OWNER" ]; then
-              GIST_OWNER="$TARGET_OWNER"
-            fi
-
-            RAW_GIST_URL="https://gist.githubusercontent.com/${GIST_OWNER}/${GIST_ID}/raw/${GIST_FILENAME}"
-
-            if curl -fsSL "$RAW_GIST_URL" -o clone_before.json; then
-              echo "Downloaded previous clone.json from gist"
+            if curl -fsSL "$RAW_URL" -o clone_before.json; then
+              echo "Downloaded previous clone data"
             else
-              echo "Could not download previous gist content. Using current data as baseline."
+              echo "Could not download previous clone data, using current data as baseline"
               cp clone.json clone_before.json
             fi
           fi
 
           echo "id=$GIST_ID" >> "$GITHUB_OUTPUT"
-          echo "owner=$GIST_OWNER" >> "$GITHUB_OUTPUT"
+          echo "owner=$LOGIN" >> "$GITHUB_OUTPUT"
 
-      - name: Merge previous data with latest traffic window
+      - name: Merge previous clone data with current API data
         run: |
           python3 - <<'PY'
           import json
 
-          def load_json(path):
+          def load(path):
               try:
                   with open(path, "r", encoding="utf-8") as f:
                       return json.load(f)
               except Exception:
                   return {}
 
-          previous = load_json("clone_before.json")
-          current = load_json("clone.json")
+          previous = load("clone_before.json")
+          current = load("clone.json")
 
           merged = {}
 
@@ -180,7 +201,7 @@ jobs:
           echo "Merged clone.json:"
           cat clone.json
 
-      - name: Update gist with merged clone stats
+      - name: Update gist
         env:
           GH_PAT: ${{ secrets.ABC_PAT }}
         run: |
@@ -199,9 +220,7 @@ jobs:
               }
             }' > update_gist.json
 
-          HTTP_CODE=$(curl -sS -L \
-            -o update_response.json \
-            -w "%{http_code}" \
+          UPDATE_CODE=$(curl -sS -o update_response.json -w "%{http_code}" \
             -X PATCH \
             -H "Authorization: Bearer ${GH_PAT}" \
             -H "Accept: application/vnd.github+json" \
@@ -210,13 +229,13 @@ jobs:
             -d @update_gist.json \
             "https://api.github.com/gists/${{ steps.gist.outputs.id }}")
 
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "Failed to update gist. HTTP $HTTP_CODE"
+          if [ "$UPDATE_CODE" != "200" ]; then
+            echo "Failed to update gist. HTTP $UPDATE_CODE"
             cat update_response.json
             exit 1
           fi
 
-      - name: Create or update CLONE.md in xyz repo
+      - name: Create or update CLONE.md
         run: |
           set -euo pipefail
 
@@ -238,6 +257,10 @@ jobs:
           <a href="${REPO_URL}"><img alt="GitHub Clones" src="${BADGE_URL}&logo=github"></a>
           \`\`\`
           EOF
+
+      - name: Commit and push if changed
+        run: |
+          set -euo pipefail
 
           git config user.name "GitHub Action"
           git config user.email "action@github.com"
