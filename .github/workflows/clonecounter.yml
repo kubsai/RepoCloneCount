@@ -81,7 +81,7 @@ jobs:
           echo "Current clone traffic:"
           jq . clone.json
 
-      - name: Find or create gist under navaranjithsai
+      - name: Find or create gist under target account
         id: gist
         env:
           GH_PAT: ${{ secrets.ABC_PAT }}
@@ -240,7 +240,7 @@ jobs:
           set -euo pipefail
 
           RAW_URL="https://gist.githubusercontent.com/${{ steps.gist.outputs.owner }}/${{ steps.gist.outputs.id }}/raw/${GIST_FILENAME}"
-          ENCODED_RAW_URL=$(python3 -c 'import os, urllib.parse; print(urllib.parse.quote(os.environ["RAW_URL"], safe=""))')
+          ENCODED_RAW_URL=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$RAW_URL")
           BADGE_URL="https://img.shields.io/badge/dynamic/json?color=success&label=Clones&query=count&url=${ENCODED_RAW_URL}"
           REPO_URL="https://github.com/${TARGET_OWNER}/${TARGET_REPO}"
 
@@ -257,6 +257,9 @@ jobs:
           <a href="${REPO_URL}"><img alt="GitHub Clones" src="${BADGE_URL}&logo=github"></a>
           \`\`\`
           EOF
+
+          echo "Generated CLONE.md:"
+          cat CLONE.md
 
       - name: Commit and push if changed
         run: |
