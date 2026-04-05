@@ -1,4 +1,4 @@
-name: GitHub Clone Count Update (Mon & Thu)
+name: GitHub Traffic Count Update (Mon & Thu)
 
 on:
   schedule:
@@ -9,8 +9,8 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   TARGET_OWNER: navaranjithsai
   TARGET_REPO: MailVoyage
-  GIST_FILENAME: clone.json
-  GIST_DESCRIPTION: MailVoyage clone statistics
+  GIST_FILENAME: traffic.json
+  GIST_DESCRIPTION: MailVoyage traffic statistics
 
 permissions:
   contents: write
@@ -58,31 +58,54 @@ jobs:
             exit 1
           fi
 
-      - name: Fetch latest clone traffic from target repo
+      - name: Fetch latest clone traffic
         env:
           GH_PAT: ${{ secrets.ABC_PAT }}
         run: |
           set -euo pipefail
 
-          API_URL="https://api.github.com/repos/${TARGET_OWNER}/${TARGET_REPO}/traffic/clones"
+          CLONES_API="https://api.github.com/repos/${TARGET_OWNER}/${TARGET_REPO}/traffic/clones"
 
-          HTTP_CODE=$(curl -sS -o clone.json -w "%{http_code}" \
+          HTTP_CODE=$(curl -sS -o clones_api.json -w "%{http_code}" \
             -H "Authorization: Bearer ${GH_PAT}" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "$API_URL")
+            "$CLONES_API")
 
           if [ "$HTTP_CODE" != "200" ]; then
             echo "Failed to fetch clone traffic. HTTP $HTTP_CODE"
-            cat clone.json
+            cat clones_api.json
             exit 1
           fi
 
           echo "Current clone traffic:"
-          jq . clone.json
+          jq . clones_api.json
 
-      - name: Find or create gist under target account
-        id: gist
+      - name: Fetch latest view traffic
+        env:
+          GH_PAT: ${{ secrets.ABC_PAT }}
+        run: |
+          set -euo pipefail
+
+          VIEWS_API="https://api.github.com/repos/${TARGET_OWNER}/${TARGET_REPO}/traffic/views"
+
+          HTTP_CODE=$(curl -sS -o views_api.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${GH_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$VIEWS_API")
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "Failed to fetch view traffic. HTTP $HTTP_CODE"
+            cat views_api.json
+            exit 1
+          fi
+
+          echo "Current view traffic:"
+          jq . views_api.json
+
+      - name: Find existing gist and download previous traffic
+        id: gist_lookup
         env:
           GH_PAT: ${{ secrets.ABC_PAT }}
         run: |
@@ -108,13 +131,115 @@ jobs:
             'map(select(.description == $desc and (.files[$file] != null))) | first | .id // empty' \
             gists.json)
 
-          if [ -z "$GIST_ID" ]; then
-            echo "No existing gist found. Creating one..."
+          if [ -n "$GIST_ID" ]; then
+            echo "Found existing gist: $GIST_ID"
+            RAW_URL="https://gist.githubusercontent.com/${LOGIN}/${GIST_ID}/raw/${GIST_FILENAME}"
+
+            if curl -fsSL "$RAW_URL" -o previous_traffic.json; then
+              echo "Downloaded previous traffic.json"
+            else
+              echo "Could not download previous traffic.json. Using empty baseline."
+              echo '{}' > previous_traffic.json
+            fi
+          else
+            echo "No existing gist found. Starting with empty baseline."
+            echo '{}' > previous_traffic.json
+          fi
+
+          echo "existing_id=$GIST_ID" >> "$GITHUB_OUTPUT"
+          echo "owner=$LOGIN" >> "$GITHUB_OUTPUT"
+
+      - name: Merge clones and views into cumulative traffic.json
+        run: |
+          python3 - <<'PY'
+          import json
+          from datetime import datetime, timezone
+
+          def load(path, default):
+              try:
+                  with open(path, "r", encoding="utf-8") as f:
+                      return json.load(f)
+              except Exception:
+                  return default
+
+          previous = load("previous_traffic.json", {})
+          clones_api = load("clones_api.json", {})
+          views_api = load("views_api.json", {})
+
+          def merge_section(previous_root, current_api, section_name, api_list_key):
+              previous_section = previous_root.get(section_name, {})
+              previous_daily = previous_section.get("daily", []) if isinstance(previous_section, dict) else []
+              current_daily = current_api.get(api_list_key, []) if isinstance(current_api, dict) else []
+
+              merged = {}
+
+              for source in (previous_daily, current_daily):
+                  for item in source:
+                      ts = item.get("timestamp")
+                      if not ts:
+                          continue
+                      merged[ts] = {
+                          "timestamp": ts,
+                          "count": int(item.get("count", 0)),
+                          "uniques": int(item.get("uniques", 0))
+                      }
+
+              daily = [merged[k] for k in sorted(merged.keys())]
+
+              return {
+                  "last_14_days_count": int(current_api.get("count", 0)),
+                  "last_14_days_uniques": int(current_api.get("uniques", 0)),
+                  "total_count": sum(x["count"] for x in daily),
+                  "total_uniques_approx": sum(x["uniques"] for x in daily),
+                  "daily": daily
+              }
+
+          traffic = {
+              "repo": f"{previous.get('repo') or ''}",
+              "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "note": "total_uniques_approx is a sum of daily uniques and may overcount repeat users across days",
+              "clones": merge_section(previous, clones_api, "clones", "clones"),
+              "views": merge_section(previous, views_api, "views", "views")
+          }
+
+          if not traffic["repo"]:
+              traffic["repo"] = ""
+
+          with open("traffic.json", "w", encoding="utf-8") as f:
+              json.dump(traffic, f, indent=2)
+          PY
+
+          python3 - <<'PY'
+          import json
+          owner = "${{ env.TARGET_OWNER }}"
+          repo = "${{ env.TARGET_REPO }}"
+          with open("traffic.json", "r", encoding="utf-8") as f:
+              data = json.load(f)
+          data["repo"] = f"{owner}/{repo}"
+          with open("traffic.json", "w", encoding="utf-8") as f:
+              json.dump(data, f, indent=2)
+          PY
+
+          echo "Merged traffic.json:"
+          cat traffic.json
+
+      - name: Create or update gist
+        id: gist_save
+        env:
+          GH_PAT: ${{ secrets.ABC_PAT }}
+        run: |
+          set -euo pipefail
+
+          LOGIN="${{ steps.auth.outputs.login }}"
+          EXISTING_GIST_ID="${{ steps.gist_lookup.outputs.existing_id }}"
+
+          if [ -z "$EXISTING_GIST_ID" ]; then
+            echo "Creating new gist..."
 
             jq -n \
               --arg desc "$GIST_DESCRIPTION" \
               --arg file "$GIST_FILENAME" \
-              --rawfile content clone.json \
+              --rawfile content traffic.json \
               '{
                 description: $desc,
                 public: false,
@@ -140,122 +265,78 @@ jobs:
               exit 1
             fi
 
-            GIST_ID=$(jq -r '.id' gist_response.json)
-            cp clone.json clone_before.json
+            FINAL_GIST_ID=$(jq -r '.id' gist_response.json)
           else
-            echo "Found existing gist: $GIST_ID"
+            echo "Updating existing gist: $EXISTING_GIST_ID"
 
-            RAW_URL="https://gist.githubusercontent.com/${LOGIN}/${GIST_ID}/raw/${GIST_FILENAME}"
-
-            if curl -fsSL "$RAW_URL" -o clone_before.json; then
-              echo "Downloaded previous clone data"
-            else
-              echo "Could not download previous clone data, using current data as baseline"
-              cp clone.json clone_before.json
-            fi
-          fi
-
-          echo "id=$GIST_ID" >> "$GITHUB_OUTPUT"
-          echo "owner=$LOGIN" >> "$GITHUB_OUTPUT"
-
-      - name: Merge previous clone data with current API data
-        run: |
-          python3 - <<'PY'
-          import json
-
-          def load(path):
-              try:
-                  with open(path, "r", encoding="utf-8") as f:
-                      return json.load(f)
-              except Exception:
-                  return {}
-
-          previous = load("clone_before.json")
-          current = load("clone.json")
-
-          merged = {}
-
-          for source in (previous.get("clones", []), current.get("clones", [])):
-              for item in source:
-                  ts = item.get("timestamp")
-                  if not ts:
-                      continue
-                  merged[ts] = {
-                      "timestamp": ts,
-                      "count": int(item.get("count", 0)),
-                      "uniques": int(item.get("uniques", 0))
+            jq -n \
+              --arg desc "$GIST_DESCRIPTION" \
+              --arg file "$GIST_FILENAME" \
+              --rawfile content traffic.json \
+              '{
+                description: $desc,
+                files: {
+                  ($file): {
+                    content: $content
                   }
-
-          clones = [merged[k] for k in sorted(merged.keys())]
-
-          result = {
-              "count": sum(x["count"] for x in clones),
-              "uniques": sum(x["uniques"] for x in clones),
-              "clones": clones
-          }
-
-          with open("clone.json", "w", encoding="utf-8") as f:
-              json.dump(result, f, indent=2)
-          PY
-
-          echo "Merged clone.json:"
-          cat clone.json
-
-      - name: Update gist
-        env:
-          GH_PAT: ${{ secrets.ABC_PAT }}
-        run: |
-          set -euo pipefail
-
-          jq -n \
-            --arg desc "$GIST_DESCRIPTION" \
-            --arg file "$GIST_FILENAME" \
-            --rawfile content clone.json \
-            '{
-              description: $desc,
-              files: {
-                ($file): {
-                  content: $content
                 }
-              }
-            }' > update_gist.json
+              }' > update_gist.json
 
-          UPDATE_CODE=$(curl -sS -o update_response.json -w "%{http_code}" \
-            -X PATCH \
-            -H "Authorization: Bearer ${GH_PAT}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            -H "Content-Type: application/json" \
-            -d @update_gist.json \
-            "https://api.github.com/gists/${{ steps.gist.outputs.id }}")
+            UPDATE_CODE=$(curl -sS -o update_response.json -w "%{http_code}" \
+              -X PATCH \
+              -H "Authorization: Bearer ${GH_PAT}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -H "Content-Type: application/json" \
+              -d @update_gist.json \
+              "https://api.github.com/gists/${EXISTING_GIST_ID}")
 
-          if [ "$UPDATE_CODE" != "200" ]; then
-            echo "Failed to update gist. HTTP $UPDATE_CODE"
-            cat update_response.json
-            exit 1
+            if [ "$UPDATE_CODE" != "200" ]; then
+              echo "Failed to update gist. HTTP $UPDATE_CODE"
+              cat update_response.json
+              exit 1
+            fi
+
+            FINAL_GIST_ID="$EXISTING_GIST_ID"
           fi
+
+          echo "id=$FINAL_GIST_ID" >> "$GITHUB_OUTPUT"
+          echo "owner=$LOGIN" >> "$GITHUB_OUTPUT"
 
       - name: Create or update CLONE.md
         run: |
           set -euo pipefail
 
-          RAW_URL="https://gist.githubusercontent.com/${{ steps.gist.outputs.owner }}/${{ steps.gist.outputs.id }}/raw/${GIST_FILENAME}"
+          RAW_URL="https://gist.githubusercontent.com/${{ steps.gist_save.outputs.owner }}/${{ steps.gist_save.outputs.id }}/raw/${GIST_FILENAME}"
           ENCODED_RAW_URL=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$RAW_URL")
-          BADGE_URL="https://img.shields.io/badge/dynamic/json?color=success&label=Clones&query=count&url=${ENCODED_RAW_URL}"
+
+          CLONES_BADGE="https://img.shields.io/badge/dynamic/json?color=success&label=Clones&query=%24.clones.total_count&url=${ENCODED_RAW_URL}"
+          VIEWS_BADGE="https://img.shields.io/badge/dynamic/json?color=blue&label=Views&query=%24.views.total_count&url=${ENCODED_RAW_URL}"
           REPO_URL="https://github.com/${TARGET_OWNER}/${TARGET_REPO}"
 
           cat > CLONE.md <<EOF
           **Markdown**
 
           \`\`\`markdown
-          [![GitHub Clones](${BADGE_URL}&logo=github)](${REPO_URL})
+          [![GitHub Total Clones](${CLONES_BADGE}&logo=github)](${REPO_URL})
+          [![GitHub Total Views](${VIEWS_BADGE}&logo=github)](${REPO_URL})
           \`\`\`
 
           **HTML**
 
           \`\`\`html
-          <a href="${REPO_URL}"><img alt="GitHub Clones" src="${BADGE_URL}&logo=github"></a>
+          <a href="${REPO_URL}"><img alt="GitHub Total Clones" src="${CLONES_BADGE}&logo=github"></a>
+          <a href="${REPO_URL}"><img alt="GitHub Total Views" src="${VIEWS_BADGE}&logo=github"></a>
           \`\`\`
+
+          **Raw traffic.json**
+
+          \`\`\`text
+          ${RAW_URL}
+          \`\`\`
+
+          > Note: total badges are cumulative from saved daily traffic history.
+          > Unique totals across all time are only approximate with GitHub traffic APIs.
           EOF
 
           echo "Generated CLONE.md:"
@@ -272,6 +353,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "update clone badge"
+            git commit -m "update traffic badges"
             git push
           fi
